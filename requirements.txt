@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pandas
+numpy
+prophet
+requests
+apscheduler
+python-dotenv
+pydantic
