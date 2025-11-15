@@ -1,14 +1,8 @@
-# predictor.py
 from prophet import Prophet
 import pandas as pd
 import numpy as np
 
 def prepare_series_df(df: pd.DataFrame, date_col: str, value_col: str) -> pd.DataFrame:
-    """
-    Prepara df para Prophet:
-      - date_col -> ds, value_col -> y
-      - clip lower 0, log1p
-    """
     df_s = df[[date_col, value_col]].copy()
     df_s = df_s.rename(columns={date_col: "ds", value_col: "y"})
     df_s['ds'] = pd.to_datetime(df_s['ds'])
@@ -17,61 +11,114 @@ def prepare_series_df(df: pd.DataFrame, date_col: str, value_col: str) -> pd.Dat
     df_s['y'] = np.log1p(df_s['y'])
     return df_s
 
-def es_forecast_inestable(history: list[int], forecast: list[int], umbral: float = 2.5) -> bool:
-    if len(history) < 3 or len(forecast) == 0:
-        return False
-    avg_hist = np.mean(history[-3:])
-    avg_fore = np.mean(forecast)
-    return (avg_hist > 0) and (avg_fore > avg_hist * umbral)
-
-def add_noise_int(array: np.ndarray, pct: float = 0.1) -> np.ndarray:
+def add_noise_int(array: np.ndarray, pct: float = 0.05) -> np.ndarray:
+    if array.size == 0:
+        return array.astype(int)
     factors = np.random.uniform(1 - pct, 1 + pct, size=array.shape)
     noisy = (array * factors).round().astype(int)
     return np.clip(noisy, 0, None)
 
-def predict_series(df_prepared: pd.DataFrame, weeks: int = 16, allow_fallback: bool = True, umbral_inestabilidad: float = 2.5) -> pd.DataFrame:
-    """
-    Recibe df preparado para Prophet (ds, y log1p) y devuelve df con ['ds','yhat'] en escala original (int).
-    Si hay pocos valores no nulos, hace fallback a promedio simple con ruido.
-    """
+def _next_semester_date_from(dt: pd.Timestamp) -> pd.Timestamp:
+    if dt.month <= 2:
+        return pd.Timestamp(year=dt.year, month=8, day=1)
+    return pd.Timestamp(year=dt.year + 1, month=2, day=1)
+
+def _make_future_semester_range(start: pd.Timestamp, periods: int) -> pd.DatetimeIndex:
+    dates = []
+    cur = _next_semester_date_from(start)
+    for _ in range(periods):
+        dates.append(cur)
+        cur = _next_semester_date_from(cur)
+    return pd.DatetimeIndex(dates)
+
+def predict_series(df_prepared: pd.DataFrame, semesters: int = 1, min_factor: float = 0.85) -> pd.DataFrame:
     df = df_prepared.copy()
-    non_zero_count = (df['y'] > 0).sum()
 
-    if non_zero_count < 6 and allow_fallback:
-        # fallback: promedio en escala original
-        avg_val = np.expm1(df['y']).mean() if len(df) > 0 else 0
-        base_val = int(round(avg_val))
-        fechas = pd.date_range(start=df['ds'].max() + pd.Timedelta(weeks=1) if len(df)>0 else pd.Timestamp.today(), periods=weeks, freq='W-MON')
-        yhat = add_noise_int(np.array([base_val] * weeks))
-        return pd.DataFrame({'ds': fechas, 'yhat': yhat})
+    # Caso pocas observaciones
+    if len(df) < 2:
+        avg_val = int(round(np.expm1(df['y']).mean())) if len(df) > 0 else 0
+        start = df['ds'].max() if len(df) > 0 else pd.Timestamp.today()
+        fechas = _make_future_semester_range(start, semesters)
+        return pd.DataFrame({
+            'ds': fechas,
+            'yhat': add_noise_int(np.array([avg_val]*semesters)),
+            'lower': [max(1, int(avg_val*0.9))]*semesters,
+            'upper': [int(avg_val*1.1)]*semesters,
+            'confidence_pct': [95.0]*semesters
+        })
 
+    # Modelo prophet
     model = Prophet(
-        weekly_seasonality=True,
+        weekly_seasonality=False,
         yearly_seasonality=False,
         daily_seasonality=False,
-        changepoint_prior_scale=0.5,
+        changepoint_prior_scale=5.0,
         seasonality_mode='additive'
     )
-    model.add_seasonality(name='monthly', period=30.5, fourier_order=5)
-
     model.fit(df)
 
-    future = model.make_future_dataframe(periods=weeks, freq='W-MON')
+    last_ds = df['ds'].max()
+    future_dates = _make_future_semester_range(last_ds, semesters)
+    future = pd.DataFrame({'ds': pd.to_datetime(list(df['ds']) + list(future_dates))})
     forecast = model.predict(future)
+    forecast_future = forecast[forecast['ds'].isin(future_dates)].copy()
 
-    forecast['yhat'] = np.expm1(forecast['yhat'].clip(lower=0))
-    forecast['yhat'] = forecast['yhat'].round().astype(int)
-    df_fore = forecast[['ds', 'yhat']].tail(weeks).reset_index(drop=True)
+    # inverse log
+    forecast_future['yhat'] = np.expm1(forecast_future['yhat'].clip(lower=0))
+    forecast_future['lower_raw'] = np.expm1(forecast_future['yhat_lower'].clip(lower=0))
+    forecast_future['upper_raw'] = np.expm1(forecast_future['yhat_upper'].clip(lower=0))
 
-    # stability check
-    hist_vals = np.expm1(df['y']).round().astype(int).tolist() if len(df)>0 else []
-    fore_vals = df_fore['yhat'].tolist()
+    last_val = int(np.expm1(df['y']).iloc[-1].round())
+    min_val = max(int(last_val * min_factor), 1)
 
-    if allow_fallback and es_forecast_inestable(hist_vals, fore_vals, umbral=umbral_inestabilidad):
-        avg_last3 = int(round(np.mean(hist_vals[-3:]))) if len(hist_vals) >= 1 else 0
-        fechas = pd.date_range(start=df['ds'].max() + pd.Timedelta(weeks=1) if len(df)>0 else pd.Timestamp.today(), periods=weeks, freq='W-MON')
-        return pd.DataFrame({'ds': fechas, 'yhat': add_noise_int(np.array([avg_last3] * weeks))})
+    # límites revisados: no exagerar min_val
+    forecast_future['lower'] = forecast_future['lower_raw'].apply(
+        lambda x: max(int(round(x)), int(min_val * 0.85))
+    )
+    forecast_future['upper'] = forecast_future['upper_raw'].apply(
+        lambda x: max(int(round(x)), forecast_future['lower'].min() + 5)
+    )
 
-    # apply soft noise
-    yhat_noisy = add_noise_int(df_fore['yhat'].values)
-    return pd.DataFrame({'ds': df_fore['ds'], 'yhat': yhat_noisy})
+    # Ruido
+    forecast_future['yhat'] = add_noise_int(forecast_future['yhat'].values)
+
+    # Corrección: mantener yhat dentro del intervalo pero evitando igualdad exacta con lower
+    def adjust_yhat(row):
+        y = row['yhat']
+        low = row['lower']
+        up = row['upper']
+        if y <= low:
+            return low + 1
+        if y >= up:
+            return up - 1
+        return y
+
+    forecast_future['yhat'] = forecast_future.apply(adjust_yhat, axis=1)
+
+    # Nuevo cálculo de confianza
+    def compute_confidence(row):
+        low = row['lower']
+        up = row['upper']
+        y = row['yhat']
+
+        # si el intervalo está degenerado
+        if up <= low:
+            return 100.0
+
+        # dentro del intervalo = alta confianza
+        if low < y < up:
+            width = up - low
+            center = (up + low) / 2
+            dist = abs(y - center)
+            return round(100 - (dist / (width/2)) * 20, 2)  
+
+        # fuera del intervalo
+        if y <= low:
+            return max(0, 100 - ((low - y) * 2))
+
+        if y >= up:
+            return max(0, 100 - ((y - up) * 2))
+
+    forecast_future['confidence_pct'] = forecast_future.apply(compute_confidence, axis=1)
+
+    return forecast_future[['ds','yhat','lower','upper','confidence_pct']]

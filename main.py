@@ -1,4 +1,3 @@
-# main.py
 import os
 import json
 from fastapi import FastAPI, HTTPException, Depends, Body
@@ -36,10 +35,15 @@ scheduler = AsyncIOScheduler(timezone="America/Bogota")
 async def startup_event():
     try:
         if not scheduler.running:
-            # Ejecutar todos los lunes a las 00:00 (ajusta si quieres otra frecuencia)
-            trigger = CronTrigger(day_of_week="mon", hour=0, minute=0, timezone="America/Bogota")
+            # Ejecutar el 20 de junio y 20 de diciembre a las 00:00 (America/Bogota)
+            trigger = CronTrigger(month='6,12', day='20', hour=0, minute=0, timezone="America/Bogota")
             scheduler.add_job(generate_all, trigger, id="projects_job", replace_existing=True)
             scheduler.start()
+            # Generar cache inicial si no existe
+            try:
+                generate_all()
+            except Exception as e:
+                print(f"[startup_event] Error generando cache inicial: {e}")
     except Exception as e:
         print(f"[startup_event] Error al iniciar scheduler: {e}")
 
@@ -88,12 +92,12 @@ class ForecastItem(BaseModel):
     name: str
     history: List[Point]
     forecasting: List[Point]
-    weeks: int
+    semesters: int
 
 @app.get("/", tags=["Root"])
 def read_root():
     return {
-        "message": "🟢 Project Forecasts API",
+        "message": "🟢 Project Forecasts API (semesters)",
         "endpoints": [
             "/cached/forecast/project-total",
             "/cached/forecast/project-line",
@@ -142,19 +146,19 @@ def get_cached_scope():
         print(f"[get_cached_scope] Error: {e}")
         raise HTTPException(status_code=500, detail="Error interno al obtener cache scope")
 
-# POST endpoints to request one item from cache by name + weeks
+# POST endpoints to request one item from cache by name + semesters
 class ForecastRequest(BaseModel):
     name: str
-    weeks: int = 16
+    semesters: int = 2
 
 @app.post("/forecast/project-total", dependencies=[Depends(get_api_key)])
 def post_forecast_total(req: ForecastRequest):
     try:
         cache = load_cache(TOTAL_CACHE, generate_all)
         for item in cache:
-            if item.get('name') == req.name and item.get('weeks') == req.weeks:
+            if item.get('name') == req.name and item.get('semesters') == req.semesters:
                 return item
-        raise HTTPException(status_code=404, detail=f"Item '{req.name}' con weeks={req.weeks} no encontrado en cache")
+        raise HTTPException(status_code=404, detail=f"Item '{req.name}' con semesters={req.semesters} no encontrado en cache")
     except HTTPException:
         raise
     except Exception as e:
@@ -166,9 +170,9 @@ def post_forecast_line(req: ForecastRequest):
     try:
         cache = load_cache(LINE_CACHE, generate_all)
         for item in cache:
-            if item.get('name') == req.name and item.get('weeks') == req.weeks:
+            if item.get('name') == req.name and item.get('semesters') == req.semesters:
                 return item
-        raise HTTPException(status_code=404, detail=f"Line '{req.name}' con weeks={req.weeks} no encontrada en cache")
+        raise HTTPException(status_code=404, detail=f"Line '{req.name}' con semesters={req.semesters} no encontrada en cache")
     except HTTPException:
         raise
     except Exception as e:
@@ -180,9 +184,9 @@ def post_forecast_tech(req: ForecastRequest):
     try:
         cache = load_cache(TECH_CACHE, generate_all)
         for item in cache:
-            if item.get('name') == req.name and item.get('weeks') == req.weeks:
+            if item.get('name') == req.name and item.get('semesters') == req.semesters:
                 return item
-        raise HTTPException(status_code=404, detail=f"Tech '{req.name}' con weeks={req.weeks} no encontrada en cache")
+        raise HTTPException(status_code=404, detail=f"Tech '{req.name}' con semesters={req.semesters} no encontrada en cache")
     except HTTPException:
         raise
     except Exception as e:
@@ -194,9 +198,9 @@ def post_forecast_scope(req: ForecastRequest):
     try:
         cache = load_cache(SCOPE_CACHE, generate_all)
         for item in cache:
-            if item.get('name') == req.name and item.get('weeks') == req.weeks:
+            if item.get('name') == req.name and item.get('semesters') == req.semesters:
                 return item
-        raise HTTPException(status_code=404, detail=f"Scope '{req.name}' con weeks={req.weeks} no encontrada en cache")
+        raise HTTPException(status_code=404, detail=f"Scope '{req.name}' con semesters={req.semesters} no encontrada en cache")
     except HTTPException:
         raise
     except Exception as e:
